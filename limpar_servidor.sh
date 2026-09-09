@@ -13,9 +13,9 @@
 #   bash <(curl -fsSL https://raw.githubusercontent.com/miau4/limpeza/main/limpar_servidor.sh)
 #
 # IMPORTANTE: use exatamente esse formato ("bash <(curl ...)"), e não
-# "curl ... | bash". O script pede confirmação digitada (interativa) antes de
-# apagar qualquer coisa; com "curl | bash" o terminal não consegue receber
-# essa digitação porque o pipe já está ocupado com o conteúdo baixado, e o
+# "curl ... | bash". O script pede confirmação (interativa) antes de apagar
+# qualquer coisa; com "curl | bash" o terminal não consegue receber essa
+# confirmação porque o pipe já está ocupado com o conteúdo baixado, e o
 # script seria cancelado sozinho. "bash <(curl ...)" resolve isso mantendo o
 # teclado conectado normalmente.
 #
@@ -30,15 +30,17 @@
 #   - Para e desabilita serviços/painéis conhecidos
 #   - Mata processos soltos ligados a esses painéis
 #   - Remove unidades systemd criadas por eles
-#   - Zera o crontab do root (com backup) e cron.d relacionado
+#   - Zera o crontab do root e cron.d relacionado
 #   - Remove usuários Linux criados por painéis (mantém opc/ubuntu/root)
 #   - Remove Nginx, Xray, stunnel, SlowDNS e configs de painel
 #   - Remove diretórios e binários conhecidos de autoscripts (SSHPlus,
-#     DragonX, RustyProxy, bot, etc.)
+#     DragonX, RustyProxy, bot, etc.) — apaga direto, sem quarentena
 #   - Restaura /etc/ssh/sshd_config ao padrão do pacote
 #   - Zera firewall (iptables, nftables, firewalld, ufw)
-#   - Opcionalmente remove pacotes genéricos instalados pelo autoscript
-#   - Faz backup de tudo que altera em /root/backup_antes_limpeza_<data>/
+#   - Remove automaticamente pacotes genéricos instalados pelo autoscript
+#
+# Este script NÃO cria backups de nada — tudo que remove/sobrescreve é
+# apagado direto, sem cópia de segurança. Ação irreversível.
 #
 # NADA relacionado ao Ubuntu, kernel, cloud-init, agente da nuvem (Oracle/AWS/
 # Azure/GCP) ou update/upgrade do sistema é tocado.
@@ -47,18 +49,15 @@
 set -e
 R=$'\033[1;31m'; G=$'\033[1;32m'; Y=$'\033[1;33m'; C=$'\033[1;36m'; NC=$'\033[0m'
 BASE="/etc/painel"
-BKDIR="/root/backup_antes_limpeza_$(date +%Y%m%d_%H%M%S)"
-QUARENTENA="/root/quarentena_bin"
-mkdir -p "$BKDIR" "$QUARENTENA"
 
 echo -e "${R}Isso vai apagar TODOS os usuários VPN, configs, serviços,${NC}"
 echo -e "${R}regras de firewall e pacotes relacionados a painéis/proxies. SEM VOLTA.${NC}"
-echo -ne "${Y}Digite 'limpar' para confirmar: ${NC}"
-read -r confirm
-[[ "$confirm" != "limpar" ]] && { echo "Cancelado."; exit 0; }
+echo -e "${R}Nenhum backup será feito — tudo é removido direto.${NC}"
+echo -ne "${Y}Pressione ENTER para continuar (CTRL+C para cancelar): ${NC}"
+read -r _confirm
 
 # =============================================================================
-echo -e "${C}[1/17] Parando e desabilitando serviços conhecidos...${NC}"
+echo -e "${C}[1/16] Parando e desabilitando serviços conhecidos...${NC}"
 SERVICOS=(xray netsimon-painel badvpn nginx stunnel4 slowdns dropbear \
           security-proxy wstest-plain wstest-tls dtproxy1 dtproxy2 \
           firewalld openvpn wg-quick@wg0 v2ray trojan hysteria-server \
@@ -69,14 +68,14 @@ for s in "${SERVICOS[@]}"; do
 done
 
 # =============================================================================
-echo -e "${C}[2/17] Matando processos soltos (por nome e por path)...${NC}"
+echo -e "${C}[2/16] Matando processos soltos (por nome e por path)...${NC}"
 pkill -9 -f "limit\.sh|proxy\.py|checkuser\.py|painel_api\.py|bot_telegram\.py|badvpn-udpgw|dnstt-server" 2>/dev/null || true
 pkill -9 -f "/etc/SSHPlus|/etc/Security|/etc/dtproxy|/etc/netsimon-wstest|/etc/bot|/opt/rustyproxy|/opt/sshplus|DragonX" 2>/dev/null || true
 pkill -9 -f "verifatt|uexpired|verifbot|initcheck|infousers" 2>/dev/null || true
 screen -wipe &>/dev/null || true
 
 # =============================================================================
-echo -e "${C}[3/17] Removendo unidades systemd conhecidas e recarregando...${NC}"
+echo -e "${C}[3/16] Removendo unidades systemd conhecidas e recarregando...${NC}"
 rm -f /etc/systemd/system/xray.service /etc/systemd/system/netsimon-painel.service \
       /etc/systemd/system/badvpn.service /etc/systemd/system/slowdns.service \
       /etc/systemd/system/security-proxy.service /etc/systemd/system/wstest-plain.service \
@@ -85,15 +84,13 @@ rm -f /etc/systemd/system/xray.service /etc/systemd/system/netsimon-painel.servi
 systemctl daemon-reload
 
 # =============================================================================
-echo -e "${C}[4/17] Fazendo backup e limpando crontab do root...${NC}"
-crontab -l -u root > "$BKDIR/crontab_root.bak" 2>/dev/null || true
+echo -e "${C}[4/16] Limpando crontab do root...${NC}"
 crontab -r -u root 2>/dev/null || true
 rm -f /etc/cron.d/xray_watchdog
 
 # =============================================================================
-echo -e "${C}[5/17] Removendo usuários customizados (mantendo opc/ubuntu/debian/root)...${NC}"
+echo -e "${C}[5/16] Removendo usuários customizados (mantendo opc/ubuntu/debian/root)...${NC}"
 WHITELIST_USERS=("opc" "ubuntu" "debian" "root" "centos" "admin")
-cp /etc/passwd "$BKDIR/passwd.bak"
 while IFS=: read -r login _ uid _ _ home shell; do
     [ -z "$login" ] && continue
     [ "$uid" -ge 1000 ] 2>/dev/null || continue
@@ -112,34 +109,36 @@ if [ -f "$BASE/usuarios.db" ]; then
 fi
 
 # =============================================================================
-echo -e "${C}[6/17] Removendo Nginx (config de painel) e restaurando padrão...${NC}"
+echo -e "${C}[6/16] Removendo Nginx (config de painel) e restaurando padrão...${NC}"
 rm -f /etc/nginx/sites-enabled/netsimon_web /etc/nginx/sites-available/netsimon_web
 rm -rf /var/www/html/*
 systemctl restart nginx &>/dev/null || true
 
 # =============================================================================
-echo -e "${C}[7/17] Removendo Xray-core, Stunnel, SlowDNS...${NC}"
+echo -e "${C}[7/16] Removendo Xray-core, Stunnel, SlowDNS...${NC}"
 bash <(curl -Ls https://github.com/XTLS/Xray-install/raw/main/install-release.sh) remove --purge &>/dev/null || true
 rm -rf /etc/xray-manager /usr/local/etc/xray /etc/slowdns /etc/stunnel
 rm -f /usr/local/bin/xray
 
 # =============================================================================
-echo -e "${C}[8/17] Removendo diretórios conhecidos de painéis/autoscripts...${NC}"
+echo -e "${C}[8/16] Removendo diretórios conhecidos de painéis/autoscripts...${NC}"
 rm -rf /etc/painel /etc/SSHPlus /etc/bot /etc/dtproxy1 /etc/dtproxy2 \
        /etc/netsimon-wstest /etc/Security /opt/rustyproxy /opt/sshplus \
        /root/DragonX
 
 # =============================================================================
-echo -e "${C}[9/17] Removendo arquivos soltos conhecidos de autoscripts...${NC}"
+echo -e "${C}[9/16] Removendo arquivos soltos conhecidos de autoscripts...${NC}"
 rm -f /etc/IP /etc/autostart /etc/bannerssh /var/log/checkuser.log \
       /usr/local/bin/menu /usr/local/bin/badvpn-udpgw /usr/local/bin/dragonx \
       /usr/local/bin/proxydt.1 /usr/local/bin/proxydt.2 /usr/local/bin/websocat \
       /bin/verifatt /bin/uexpired
 
 # =============================================================================
-echo -e "${C}[10/17] Colocando em quarentena scripts/binários conhecidos de autoscript...${NC}"
+echo -e "${C}[10/16] Apagando scripts/binários conhecidos de autoscript...${NC}"
 # Lista consolidada a partir de análise real de servidores infectados por
 # autoscripts (SSHPlus / DragonX / RustyProxy / NetSimon e variantes).
+# Apaga direto (sem quarentena), já que o objetivo é ficar o mais próximo
+# possível de um sistema recém-formatado.
 KNOWN_BAD_BIN=(
     NF ShellBot.sh alfa_proxy alterarlimite alterarsenha attscript badvpn \
     badvpn.sh blocksite blockt blockuser botssh botssh.sh botteste.sh \
@@ -153,17 +152,18 @@ KNOWN_BAD_BIN=(
     versao websocket.sh ws wsmenu ajuda ajuda.sh h key infousers initcheck \
     mhtop
 )
+removidos=0
 for dir in /bin /usr/bin /usr/local/bin; do
     for f in "${KNOWN_BAD_BIN[@]}"; do
-        [ -f "$dir/$f" ] && mv "$dir/$f" "$QUARENTENA/" 2>/dev/null
+        if [ -f "$dir/$f" ]; then
+            rm -f "$dir/$f" 2>/dev/null && removidos=$((removidos+1))
+        fi
     done
 done
-echo "  Itens movidos para $QUARENTENA (revise antes de apagar definitivamente):"
-ls "$QUARENTENA" 2>/dev/null | wc -l
+echo "  Binários removidos: $removidos"
 
 # =============================================================================
-echo -e "${C}[11/17] Restaurando /etc/ssh/sshd_config original...${NC}"
-cp /etc/ssh/sshd_config "$BKDIR/sshd_config.bak" 2>/dev/null || true
+echo -e "${C}[11/16] Restaurando /etc/ssh/sshd_config original...${NC}"
 if [ -f /etc/ssh/sshd_config.ucf-dist ]; then
     cp /etc/ssh/sshd_config.ucf-dist /etc/ssh/sshd_config
     echo -e "${G}  sshd_config restaurado a partir do padrão do pacote.${NC}"
@@ -175,17 +175,17 @@ if sshd -t 2>/dev/null; then
     systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
     echo -e "${G}  sshd validado e reiniciado.${NC}"
 else
-    echo -e "${R}  ATENÇÃO: sshd_config falhou no teste (sshd -t). Restaure de $BKDIR/sshd_config.bak se o SSH cair.${NC}"
+    echo -e "${R}  ATENÇÃO: sshd_config falhou no teste (sshd -t). Nenhum backup foi feito — corrija manualmente se o SSH cair.${NC}"
 fi
 
 # =============================================================================
-echo -e "${C}[12/17] Zerando firewall (iptables + nftables)...${NC}"
+echo -e "${C}[12/16] Zerando firewall (iptables + nftables)...${NC}"
 iptables -F; iptables -t nat -F; iptables -t mangle -F; iptables -X
 ip6tables -F 2>/dev/null || true; ip6tables -X 2>/dev/null || true
 nft flush ruleset 2>/dev/null || true
 netfilter-persistent save &>/dev/null || true
 
-echo -e "${C}[13/17] Tratando firewalld e ufw (se instalados)...${NC}"
+echo -e "${C}[13/16] Tratando firewalld e ufw (se instalados)...${NC}"
 if command -v firewall-cmd &>/dev/null; then
     systemctl stop firewalld 2>/dev/null || true
     systemctl disable firewalld 2>/dev/null || true
@@ -194,54 +194,42 @@ ufw --force reset &>/dev/null || true
 ufw disable &>/dev/null || true
 
 # =============================================================================
-echo -e "${C}[14/17] Restaurando sysctl relacionado a rede (ip_forward)...${NC}"
+echo -e "${C}[14/16] Restaurando sysctl relacionado a rede (ip_forward)...${NC}"
 sed -i '/^net.ipv4.ip_forward = 1/d' /etc/sysctl.conf 2>/dev/null || true
 sysctl -w net.ipv4.ip_forward=0 &>/dev/null || true
 
 # =============================================================================
-echo -e "${C}[15/17] Removendo pacotes claramente ligados a painéis/proxies...${NC}"
+echo -e "${C}[15/16] Removendo pacotes ligados a painéis/proxies e ferramentas genéricas...${NC}"
 apt purge -y stunnel4 socat &>/dev/null || true
 if command -v firewall-cmd &>/dev/null; then
     apt purge -y firewalld &>/dev/null || true
 fi
-
-echo -ne "${Y}Remover TAMBÉM ferramentas genéricas (screen, figlet, boxes, lolcat, nload, speedtest-cli, dos2unix, at, dnsutils, net-tools)? (s/n): ${NC}"
-read -r resp_pkg
-if [[ "$resp_pkg" == "s" ]]; then
-    apt purge -y screen figlet boxes lolcat nload speedtest-cli dos2unix at dnsutils net-tools sqlite3 iptables-persistent &>/dev/null || true
-    apt autoremove -y &>/dev/null || true
-    echo -e "${G}  Pacotes removidos.${NC}"
-else
-    echo -e "${Y}  Pacotes mantidos.${NC}"
-fi
+apt purge -y screen figlet boxes lolcat nload speedtest-cli dos2unix at dnsutils net-tools sqlite3 iptables-persistent &>/dev/null || true
+apt autoremove -y &>/dev/null || true
+echo -e "${G}  Pacotes removidos.${NC}"
 
 # =============================================================================
-echo -e "${C}[16/17] Verificando binários que não pertencem a nenhum pacote apt (diagnóstico)...${NC}"
-SUSPFILE="$BKDIR/binarios_suspeitos.txt"
-> "$SUSPFILE"
+echo -e "${C}[16/16] Verificando binários que não pertencem a nenhum pacote apt (diagnóstico)...${NC}"
+encontrados=0
 for dir in /usr/local/bin /usr/local/sbin; do
     for f in "$dir"/*; do
         [ -f "$f" ] || continue
-        dpkg -S "$f" &>/dev/null || echo "$f" >> "$SUSPFILE"
+        if ! dpkg -S "$f" &>/dev/null; then
+            echo "  - $f"
+            encontrados=$((encontrados+1))
+        fi
     done
 done
-if [ -s "$SUSPFILE" ]; then
-    echo -e "${Y}  Encontrados arquivos fora de /bin,/usr/bin que não pertencem a pacotes apt.${NC}"
-    echo -e "${Y}  Lista salva em: $SUSPFILE (revise manualmente, pode ter falso positivo).${NC}"
+if [ "$encontrados" -gt 0 ]; then
+    echo -e "${Y}  Encontrados $encontrados arquivo(s) fora de /bin,/usr/bin que não pertencem a pacotes apt.${NC}"
+    echo -e "${Y}  Listados acima só para revisão manual (pode ter falso positivo) — nada foi salvo em disco.${NC}"
 else
     echo -e "${G}  Nenhum item adicional encontrado em /usr/local/bin.${NC}"
 fi
 echo -e "${Y}  Nota: /bin e /sbin são links para /usr/bin e /usr/sbin neste Ubuntu, e o dpkg${NC}"
 echo -e "${Y}  às vezes não reconhece esse link — por isso não escaneamos essas pastas aqui${NC}"
 echo -e "${Y}  automaticamente (gera muito falso positivo). A lista de nomes conhecidos do${NC}"
-echo -e "${Y}  passo [10/17] já cobre os casos reais encontrados em autoscripts.${NC}"
-
-# =============================================================================
-echo -e "${C}[17/17] Backup e quarentena desta limpeza salvos em:${NC}"
-echo "  $BKDIR"
-echo "  $QUARENTENA"
+echo -e "${Y}  passo [10/16] já cobre os casos reais encontrados em autoscripts.${NC}"
 
 echo ""
 echo -e "${G}✅ Limpeza concluída. Servidor o mais próximo possível de recém-formatado.${NC}"
-echo -e "${Y}Revise $QUARENTENA e, se estiver tudo certo, apague com:${NC}"
-echo -e "${Y}  rm -rf $QUARENTENA${NC}"
