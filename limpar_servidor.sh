@@ -27,7 +27,9 @@
 #
 # ---------------------------------------------------------------------------
 # USO:
-#   bash <(curl -fsSL https://raw.githubusercontent.com/SEU_USUARIO/SEU_REPO/main/limpar_servidor.sh)
+#
+#   bash <(curl -fsSL https://raw.githubusercontent.com/miau4/limpeza/main/limpar_servidor.sh)
+#
 #   (não use "curl ... | bash" — quebra a leitura do ENTER de confirmação)
 # ---------------------------------------------------------------------------
 #
