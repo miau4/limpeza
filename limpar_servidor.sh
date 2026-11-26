@@ -1,6 +1,6 @@
 #!/bin/bash
 ###############################################################################
-# limpar_servidor.sh (v3 — revisado)
+# limpar_servidor.sh (v3.1 — revisado)
 #
 # Remove painéis, scripts e serviços de VPN/proxy (NetSimon, SSHPlus, DragonX,
 # RustyProxy, Xray, stunnel, badvpn, dtproxy, security-proxy, wstest, etc.)
@@ -30,6 +30,22 @@
 #
 #   Exemplo: RESET_SSHD=0 PURGAR_NGINX=1 bash <(curl -fsSL URL)
 # ---------------------------------------------------------------------------
+#
+# MUDANÇAS DA V3.1 EM RELAÇÃO À V3:
+#   - NOVO (passo 2): remove UDP gateways (badvpn/udpgw) por ASSINATURA, não só
+#     por nome. A v3 só conhecia "badvpn"; um serviço com outro nome (ex.:
+#     sshorizon-udp-7300.service, binário /bin/sshorizon-udp) ficava de pé,
+#     seguia ocupando a porta 7300 e o badvpn do painel nunca subia ("bind
+#     failed" em loop). A assinatura é o ExecStart do unit / a linha de comando
+#     do processo (udpgw, sshorizon, --max-connections-for-client). Remove o
+#     unit, os drop-ins, o binário (se não for de pacote apt) e confere se a
+#     porta 7300 ficou livre.
+#   - badvpn: agora apaga também badvpn.service.d/ (a sobreposição
+#     override.conf), badvpn@.service e os backups /root/badvpn.service.bak-*.
+#     A v3 apagava só o badvpn.service e deixava o drop-in órfão.
+#   - Padrões de unit/processo/binário incluem sshorizon e udpgw.
+#   - Verificação final: mostra o PROCESSO dono de cada porta e avisa se algo
+#     ainda escuta na 7300.
 #
 # MUDANÇAS DA V3 EM RELAÇÃO À V2:
 #   - NOVO (passo 13): limpa banner/linhas de autoscript do .bashrc, .profile,
@@ -91,7 +107,7 @@ echo -e "${Y}Opções: RESET_SSHD=$RESET_SSHD LIMPAR_POSTGRES=$LIMPAR_POSTGRES P
 echo -ne "${Y}Pressione ENTER para continuar (CTRL+C para cancelar): ${NC}"
 read -r _confirm
 
-STEP=0; TOTAL=20
+STEP=0; TOTAL=21
 passo() { STEP=$((STEP+1)); echo -e "${C}[${STEP}/${TOTAL}] $*${NC}"; }
 
 # --- BEGIN FUNCOES ----------------------------------------------------------
@@ -104,7 +120,7 @@ matar_padrao() {
     return 0
 }
 
-PADRAO_UNITS='netsimon|sshplus|sshpanel|dragonx|rustyproxy|wstest|dtproxy|security-proxy|whatsapp-bot|checkuser|limiter|badvpn|slowdns|dnstt|xray|v2ray|trojan|hysteria|3proxy|squid|dropbear|stunnel|openvpn|wg-quick@|wss@|wss-security@|proxy@|firewalld|fail2ban'
+PADRAO_UNITS='netsimon|sshplus|sshpanel|dragonx|rustyproxy|wstest|dtproxy|security-proxy|whatsapp-bot|checkuser|limiter|badvpn|sshorizon|udpgw|slowdns|dnstt|xray|v2ray|trojan|hysteria|3proxy|squid|dropbear|stunnel|openvpn|wg-quick@|wss@|wss-security@|proxy@|firewalld|fail2ban'
 
 # Lista units .service (instaladas OU carregadas) que casam com o padrão.
 listar_units() {
@@ -212,6 +228,126 @@ ajustar_sshd() {
 }
 # --- END FUNCOES ------------------------------------------------------------
 
+# --- BEGIN UDPGW ------------------------------------------------------------
+# O udpgw (badvpn) é sempre iniciado com as mesmas flags, mesmo quando um
+# instalador troca o nome do binário/serviço (ex.: "sshorizon-udp" e
+# sshorizon-udp-7300.service). Por isso a detecção é pela ASSINATURA (flags do
+# ExecStart / linha de comando), e não só pelo nome "badvpn".
+UDPGW_NOME_RE='udpgw|sshorizon'
+UDPGW_FLAG='--max-connections-for-client'
+UDPGW_UNIT_RE='^[[:space:]]*ExecStart=.*(udpgw|sshorizon|max-connections-for-client)'
+
+# Caminho do binário na primeira linha ExecStart= não vazia de um unit/drop-in
+# (ignora os prefixos especiais -, @, +, ! e :).
+bin_do_execstart() {
+    sed -nE 's/^[[:space:]]*ExecStart=[-@+!:]*[[:space:]]*([^[:space:]]+).*/\1/p' "$1" 2>/dev/null | head -1
+}
+
+# Apaga um binário (e o alvo, se for symlink) SÓ se não pertencer a pacote apt e
+# estiver em diretório "de instalador". Evita apagar /usr/bin/bash e similares
+# quando o ExecStart é "bash -c ...".
+remover_binario_orfao() {
+    local b="$1" real f
+    [ -n "$b" ] || return 0
+    [ -e "$b" ] || [ -L "$b" ] || return 0
+    real=$(readlink -f -- "$b" 2>/dev/null) || real="$b"
+    # Em Ubuntu com /bin -> /usr/bin o dpkg só conhece o caminho /usr/bin/...
+    # (dpkg -S /bin/bash falha). Por isso o dono é checado no caminho REAL e no
+    # informado, e se QUALQUER um for de pacote nada é apagado.
+    if dpkg -S "$real" &>/dev/null || dpkg -S "$b" &>/dev/null; then
+        echo -e "${Y}  ! $b pertence a um pacote apt — mantido${NC}"
+        return 0
+    fi
+    for f in "$b" "$real"; do
+        [ -e "$f" ] || [ -L "$f" ] || continue
+        case "$f" in
+            /bin/*|/sbin/*|/usr/bin/*|/usr/sbin/*|/usr/local/*|/opt/*|/root/*|/etc/*|/home/*|/tmp/*|/var/tmp/*) ;;
+            *) continue ;;
+        esac
+        rm -f -- "$f" 2>/dev/null && echo "  - binário removido: $f"
+    done
+    return 0
+}
+
+# Remove TODO udpgw/badvpn, inclusive clones com outro nome. Para units e
+# processos ANTES de apagar arquivos (senão o Restart=always religa tudo).
+limpar_udpgw() {
+    local f u d p pid exe cmd b dono anc
+    local -a bins=() files=() units=()
+    local -A seen=()
+
+    # PIDs que NUNCA são mortos: este script e TODA a cadeia de pais (sudo, ssh,
+    # "bash -c '...'" etc.), cuja linha de comando pode conter o texto das flags.
+    anc=" "
+    pid=$$
+    while [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null; do
+        anc+="$pid "
+        pid=$(awk '/^PPid:/ {print $2}' "/proc/$pid/status" 2>/dev/null)
+    done
+
+    # (a) units/drop-ins próprios em /etc/systemd/system com a assinatura.
+    #     "grep -r" não segue symlinks: só pega arquivos reais, não os links
+    #     "wants" do multi-user.target.
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        files+=("$f")
+        b=$(bin_do_execstart "$f")
+        [ -n "$b" ] && bins+=("$b")
+        u=""
+        case "$f" in
+            */*.service.d/*.conf) d=$(dirname "$f"); u=$(basename "$d"); u=${u%.d} ;;
+            *.service)            u=$(basename "$f") ;;
+        esac
+        [ -n "$u" ] && units+=("$u")
+    done < <(grep -rlE "$UDPGW_UNIT_RE" /etc/systemd/system 2>/dev/null)
+
+    # (b) para e desabilita as units encontradas
+    for u in "${units[@]}"; do
+        [ -n "${seen[$u]:-}" ] && continue
+        seen[$u]=1
+        echo "  -> parando/desabilitando: $u"
+        systemctl disable --now "$u" &>/dev/null
+        systemctl reset-failed "$u" &>/dev/null
+    done
+
+    # (c) mata processos udpgw ainda vivos, mesmo com binário renomeado/apagado
+    for p in /proc/[0-9]*; do
+        pid=${p#/proc/}
+        case "$anc" in *" $pid "*) continue ;; esac
+        exe=$(readlink "$p/exe" 2>/dev/null) || continue
+        [ -n "$exe" ] || continue
+        exe=${exe% (deleted)}
+        cmd=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null)
+        if [[ "$(basename "$exe")" =~ $UDPGW_NOME_RE ]] || [[ "$cmd" == *"$UDPGW_FLAG"* ]]; then
+            echo "  -> matando PID $pid: ${cmd:0:90}"
+            bins+=("$exe")
+            kill -9 "$pid" 2>/dev/null
+        fi
+    done
+
+    # (d) apaga binários órfãos, units e drop-ins
+    for b in "${bins[@]}"; do remover_binario_orfao "$b"; done
+    for f in "${files[@]}"; do
+        if rm -f -- "$f" 2>/dev/null; then echo "  - removido: $f"; fi
+        d=$(dirname "$f")
+        case "$d" in *.service.d) rmdir "$d" 2>/dev/null ;; esac
+    done
+    systemctl daemon-reload 2>/dev/null
+
+    # (e) a 7300 precisa ter ficado livre
+    sleep 1
+    if command -v ss &>/dev/null; then
+        dono=$(ss -tulnpH 2>/dev/null | awk '$5 ~ /:7300$/ {print $1, $5, $7}')
+        if [ -n "$dono" ]; then
+            echo -e "${Y}  ! algo ainda escuta na 7300: $dono${NC}"
+        else
+            echo "  porta 7300 livre."
+        fi
+    fi
+    return 0
+}
+# --- END UDPGW --------------------------------------------------------------
+
 WHITELIST_USERS=("opc" "ubuntu" "debian" "root" "centos" "admin")
 [ -n "${SUDO_USER:-}" ] && WHITELIST_USERS+=("$SUDO_USER")
 
@@ -233,6 +369,10 @@ for u in $(listar_units); do
 done
 
 # =============================================================================
+passo "Removendo UDP gateways (badvpn/udpgw), inclusive clones renomeados (ex.: sshorizon-udp)..."
+limpar_udpgw
+
+# =============================================================================
 passo "Matando PM2 e processos Node.js de painéis..."
 command -v pm2 &>/dev/null && pm2 kill &>/dev/null
 matar_padrao "PM2|pm2"
@@ -241,7 +381,7 @@ rm -rf /root/.pm2 /home/*/.pm2
 
 # =============================================================================
 passo "Matando processos soltos (por nome e por path)..."
-matar_padrao "limit\.sh|proxy\.py|checkuser\.py|painel_api\.py|bot_telegram\.py|badvpn-udpgw|dnstt-server"
+matar_padrao "limit\.sh|proxy\.py|checkuser\.py|painel_api\.py|bot_telegram\.py|udpgw|sshorizon|dnstt-server"
 matar_padrao "/etc/SSHPlus|/etc/Security|/etc/dtproxy|/etc/netsimon-wstest|/etc/bot|/opt/rustyproxy|/opt/sshplus|DragonX|/root/painel|/etc/painel/"
 matar_padrao "verifatt|uexpired|verifbot|initcheck|infousers|ws_real_tunnel|wss_security|wss_watchdog|wss\.py|vpn_multiplexer|netsimon-bhttp"
 matar_padrao "/usr/share/\.plus|/usr/lib/sshplus"
@@ -249,12 +389,15 @@ screen -wipe &>/dev/null
 
 # =============================================================================
 passo "Removendo unidades systemd (arquivos, drop-ins e links quebrados)..."
-for n in xray xray@ netsimon-painel netsimon-bhttp netsimon-bhttpd badvpn slowdns \
+for n in xray xray@ netsimon-painel netsimon-bhttp netsimon-bhttpd badvpn badvpn@ slowdns \
          security-proxy wstest-plain wstest-tls dtproxy1 dtproxy2 sshplus sshpanel \
          checkuser limiter whatsapp-bot proxy@ wss@ wss-security@ dnstt-server; do
     rm -f "/etc/systemd/system/$n.service"
 done
 rm -rf /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d
+# badvpn: unit, template (badvpn@), drop-ins (badvpn.service.d/override.conf) e
+# links "wants"; também clones do udpgw (sshorizon-udp-7300.service etc.).
+find /etc/systemd/system \( -iname 'badvpn*' -o -iname '*sshorizon*' -o -iname '*udpgw*' \) -exec rm -rf {} + 2>/dev/null
 find /etc/systemd/system -iname '*netsimon*' -exec rm -rf {} + 2>/dev/null
 find /etc/systemd/system \( -iname '*sshplus*' -o -iname '*dragonx*' -o -iname '*rustyproxy*' -o -iname '*sshpanel*' \) -exec rm -rf {} + 2>/dev/null
 rmdir /etc/systemd/system/ssh.service.d /etc/systemd/system/sshd.service.d 2>/dev/null
@@ -357,7 +500,8 @@ KNOWN_BAD_BIN=(
     reiniciarservicos reiniciarsistema remover senharoot sshmonitor \
     swapmemory tcptweaker.sh trojan-go userbackup v2raymanager verifbot \
     versao websocket.sh ws wsmenu ajuda ajuda.sh h key infousers initcheck \
-    mhtop Plus sshpanel netsimon-bhttpd netsimon-bhttp
+    mhtop Plus sshpanel netsimon-bhttpd netsimon-bhttp \
+    badvpn-udpgw sshorizon-udp sshorizon
 )
 removidos=0
 for dir in /bin /usr/bin /usr/local/bin /usr/sbin /usr/local/sbin; do
@@ -375,6 +519,9 @@ rm -rf /root/quarentena_bin /root/backup_antes_limpeza_* /root/backup_limpeza_ba
        /root/auditoria_servidor_*.txt /root/install_log.txt \
        /root/strace_log.txt /root/*.pcap /root/Plus /root/Plus.* \
        /root/*.bak /root/usuarios.db.bak
+# backups do badvpn (ex.: /root/badvpn.service.bak-2026-09-30-0453) e da
+# remoção manual do sshorizon-udp (/root/bkp-sshorizon)
+rm -rf /root/badvpn.service.bak* /root/*.service.bak* /root/bkp-sshorizon
 : > /root/.bash_history 2>/dev/null
 : > /var/log/auth.log 2>/dev/null
 : > /var/log/btmp 2>/dev/null
@@ -608,15 +755,18 @@ echo "  Binários órfãos removidos de /usr/local: $removidos_orfaos"
 # =============================================================================
 passo "Verificação final (o que ainda sobrou)..."
 echo "  Processos suspeitos:"
-restos=$(pgrep -fa "xray|stunnel|badvpn|dnstt|slowdns|dtproxy|wstest|sshplus|checkuser|painel_api|whatsapp_bot|pm2|wss\.py|proxy\.py" 2>/dev/null \
+restos=$(pgrep -fa "xray|stunnel|badvpn|udpgw|sshorizon|dnstt|slowdns|dtproxy|wstest|sshplus|checkuser|painel_api|whatsapp_bot|pm2|wss\.py|proxy\.py" 2>/dev/null \
          | grep -vE "pgrep|limpar_servidor|/dev/fd/") 
 [ -n "$restos" ] && echo "$restos" | sed 's/^/    /' || echo "    nenhum"
 echo "  Units com falha:"
 falhas=$(systemctl --failed --no-legend --no-pager 2>/dev/null)
 [ -n "$falhas" ] && echo "$falhas" | sed 's/^/    /' || echo "    nenhuma"
-echo "  Portas escutando agora (esperado: só ssh/dns local):"
+echo "  Portas escutando agora, com o processo dono (esperado: só ssh/dns local):"
 if command -v ss &>/dev/null; then
-    ss -tulnH 2>/dev/null | awk '{print "    " $1, $5}' | sort -u
+    ss -tulnpH 2>/dev/null | awk '{print "    " $1, $5, $7}' | sort -u
+    if ss -tulnH 2>/dev/null | awk '$5 ~ /:7300$/ {f=1} END {exit !f}'; then
+        echo -e "${Y}  ! ATENÇÃO: ainda há algo escutando na porta 7300 (udpgw). Veja o processo dono acima.${NC}"
+    fi
 fi
 
 echo ""
